@@ -64,6 +64,7 @@
       <button id="btnHome">I'm home</button>
     </div>
     <div id="link"><span class="dot"></span><span id="linkText">checking cloud + house…</span></div>
+    <div id="kbStatus" style="font-size:.75rem;margin-top:4px;"></div>
     <div id="result" class="result"></div>
     <div class="sub" style="margin-top:8px;">Chat below is direct-to-cloud and works even with the house off. These two buttons only need the house.</div>
   </div>
@@ -125,6 +126,115 @@ Key facts you carry at all times:
 const $ = (id) => document.getElementById(id);
 const DAY_KEY = "phoneValerieDiary";
 const GRAB_KEY = "phoneValerieGrab";   // last successful grab (what phone has of TR)
+const KB_IDB_NAME = "valerieKB";
+const KB_IDB_STORE = "kbIndex";
+const KB_VERSION = 1;
+let kbIndex = null;       // in-memory parsed index (loaded from IDB on startup)
+let kbReady = false;      // true once the IDB read completes
+
+// ---------------- KB / phone-side RAG ------------------------------------
+// When Ray taps "I'm leaving", the TR bundles a lightweight keyword-search
+// index (tools/kb_index.json) into the grab payload. This lives in IndexedDB
+// so it persists across page reloads — zero TR dependency after the initial
+// grab. Before each chat message, we score the query against the local index,
+// pull the top-3 relevant passages, and inject them into the system prompt.
+// Score: simple word-overlap with heading boost (headings count double).
+// Max 3 results, each capped at 600 chars to keep the prompt lean.
+
+function openKBDB(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(KB_IDB_NAME, KB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(KB_IDB_STORE))
+        db.createObjectStore(KB_IDB_STORE, {keyPath:"id"});
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(req.error);
+  });
+}
+async function loadKBFromDB(){
+  try{
+    const db = await openKBDB();
+    return new Promise((resolve, reject)=>{
+      const tx = db.transaction(KB_IDB_STORE, "readonly");
+      const req = tx.objectStore(KB_IDB_STORE).get("index");
+      req.onsuccess = () => resolve(req.result ? req.result.data : null);
+      req.onerror = () => resolve(null);
+    });
+  }catch(e){ return null; }
+}
+async function saveKBToDB(data){
+  try{
+    const db = await openKBDB();
+    return new Promise((resolve, reject)=>{
+      const tx = db.transaction(KB_IDB_STORE, "readwrite");
+      tx.objectStore(KB_IDB_STORE).put({id:"index", data});
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }catch(e){ return null; }
+}
+// Keyword scorer: split query into words, score each doc by word match in
+// flat text (1x) and headings (2x). Return top-3 with their content.
+function ragSearch(query, indexData, topK=3){
+  if(!indexData || !indexData.docs) return [];
+  const terms = query.toLowerCase().replace(/[^a-z0-9\\s]/g," ").split(/\s+/).filter(Boolean);
+  if(!terms.length) return [];
+  const scored = indexData.docs.map(d => {
+    let score = 0;
+    // headings get 2x weight
+    const hLower = (d.headings||[]).join(" ").toLowerCase();
+    for(const t of terms){ if(hLower.includes(t)) score += 2; }
+    // body gets 1x
+    const f = d.flat || "";
+    for(const t of terms){
+      let idx = 0;
+      while((idx = f.indexOf(t, idx)) !== -1){ score += 1; idx += t.length; }
+    }
+    return {path:d.path, score, content:(d.content||"").slice(0,600)};
+  });
+  return scored.filter(d=>d.score>0).sort((a,b)=>b.score-a.score).slice(0,topK);
+}
+// Build the RAG context block from search results.
+function buildRAGContext(results){
+  if(!results.length) return "";
+  const lines = [];
+  for(let i=0;i<results.length;i++){
+    lines.push(`=== Knowledge ${i+1}: ${results[i].path} ===`);
+    lines.push(results[i].content);
+    lines.push("");
+  }
+  return "## Phone RAG Context\n" + lines.join("\n");
+}
+// Store a fresh KB index (from a /grab response) into IDB and memory.
+async function storeKBIndex(rawJSON){
+  try{
+    const parsed = JSON.parse(rawJSON);
+    kbIndex = parsed;
+    kbReady = true;
+    await saveKBToDB(parsed);
+    const meta = parsed.doc_count||"?";
+    console.log(`[KB] stored ${meta} docs, ${Math.round((rawJSON.length)/1024)} KB`);
+  }catch(e){ console.error("[KB] parse failed",e); }
+}
+// Called on startup to restore from IDB if available.
+async function restoreKB(){
+  const saved = await loadKBFromDB();
+  if(saved){ kbIndex = saved; kbReady = true; console.log("[KB] restored from IDB:", saved.doc_count, "docs"); }
+}
+// Update the KB status indicator in the UI.
+function updateKBStatus(){
+  const el = document.getElementById("kbStatus");
+  if(!el) return;
+  if(kbReady && kbIndex){
+    el.textContent = `📚 KB loaded (${kbIndex.doc_count} docs, ${Math.round(kbIndex.total_bytes/1024)} KB)`;
+    el.style.color = "var(--ok)";
+  } else {
+    el.textContent = "📚 KB: not synced yet — tap 'I'm leaving' when house is on";
+    el.style.color = "var(--dim)";
+  }
+}
 
 // ---------------- diary (conversation + summary) ----------------
 function todayStr(){ const d=new Date();
@@ -209,6 +319,12 @@ async function doLeave(){
     // verify: we actually hold today-dated content, non-zero
     const hasToday = Object.keys(j.files).some(k=>k.includes(todayStr()));
     ok(`✅ leaving-synced — phone now holds the house diary: ${j.file_count} pages, ${Math.round(j.bytes/1024)} KB, up to ${j.stamp.slice(0,10)}${hasToday?" (today included ✓)":""}.`);
+    // Store KB index in IndexedDB for phone-side RAG (persists across reloads)
+    const kbRaw = j.files["tools/kb_index.json"];
+    if(kbRaw){
+      await storeKBIndex(kbRaw);
+      updateKBStatus();
+    }
   }catch(e){ fail("❌ grab failed ("+e.message+") — nothing pulled, nothing changed. Try again."); }
   setBusy(false);
 }
@@ -262,6 +378,8 @@ $("btnLeave").onclick = doLeave;
 $("btnHome").onclick = doHome;
 renderDiary();
 refreshLink();
+// Restore KB from IDB (persists across reloads — no TR needed)
+restoreKB().then(()=>{ updateKBStatus(); });
 // expose for the chat layer to drop lines in:
 window.valerieDiary = { line: diaryLine, summary: diarySummary, harvest: harvestSession };
 
@@ -325,9 +443,16 @@ async function sendChat(){
   // also log this line to the diary (the phone keeps its own day even out here)
   window.valerieDiary.line("me", text);
   try{
+    // ---- Phone-side RAG: score query against local KB index ----
+    let ragCtx = "";
+    if(kbReady && kbIndex){
+      const hits = ragSearch(text, kbIndex, 3);
+      ragCtx = buildRAGContext(hits);
+    }
     // DIRECT-TO-CLOUD: the phone page calls the Agnes hub itself. No TR, no /chat
     // front-end on the house. TR can be fully off and this still works.
-    const msgs = [{role:"system", content:CLOUD_BASELINE}, ...chatHistory];
+    // Inject RAG context into the system prompt so the cloud brain answers from facts.
+    const msgs = [{role:"system", content: CLOUD_BASELINE + (ragCtx ? "\n\n" + ragCtx : "")}, ...chatHistory];
     const r = await fetch(CLOUD_API + "/chat/completions", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+CLOUD_KEY },
