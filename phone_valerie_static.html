@@ -177,18 +177,83 @@ async function saveKBToDB(data){
 }
 // Keyword scorer: split query into words, score each doc by word match in
 // flat text (1x) and headings (2x). Return top-3 with their content.
+// Stop-word list: these inflate scores across unrelated docs and drown real matches.
+const STOP_WORDS = new Set([
+  "i","me","my","we","our","us","you","your","he","she","it","they",
+  "is","are","was","were","be","been","being","have","has","had",
+  "do","does","did","will","would","shall","should","can","could",
+  "of","in","to","for","with","on","at","by","from","as","into",
+  "through","during","before","after","above","below","between","out",
+  "off","over","under","again","further","then","once","here","there",
+  "when","where","why","how","all","each","every","both","few","more",
+  "most","other","some","such","no","nor","not","only","own","same",
+  "so","than","too","very","just","because","but","and","or","if",
+  "about","up","down","any","this","that","these","those","what","which",
+]);
+// Query-term expansion: when the user says X, also search for Y.
+// Maps a raw search term -> [synonyms to also look for].
+const SYNONYMS = {
+  // Family
+  "kids": ["children","daughter","daughters","sons","son","girl","girls","boy","boys"],
+  "children": ["kids","daughter","daughters","sons","son","girl","girls","boy","boys"],
+  "kid": ["children","daughter","daughters","sons","son","girl","girls","boy","boys"],
+  "birthday": ["born","birth","anniversary"],
+  "born": ["birthday","birth"],
+  "birth": ["birthday","born"],
+  "daughter": ["kids","children","daughter","daughters","girl","girls"],
+  "daughters": ["kids","children","daughter","girl","girls"],
+  "son": ["kids","children","sons","boy","boys"],
+  "sons": ["kids","children","son","boy","boys"],
+  "wife": ["valerie","honey","hon"],
+  "husband": ["ray"],
+  // Solar / tech
+  "inverter": ["inverters","hybrid"],
+  "inverters": ["inverter","hybrid"],
+  "solar": ["panels","pv","photovoltaic","array","panel"],
+  "panels": ["solar","pv","photovoltaic","panel","array"],
+  "panel": ["solar","panels","pv","photovoltaic","array"],
+  "battery": ["batteries","bank","lifepo4"],
+  "batteries": ["battery","bank","lifepo4"],
+  "picked": ["choose","selection","decision","pick","final","selected"],
+  "choose": ["picked","selection","decision","pick","final","selected"],
+  "final": ["picked","choose","selection","decision","pick","selected"],
+  // General
+  "how": ["many","much","count","number"],
+  "many": ["how","much","count","number"],
+  "much": ["how","many","count","number"],
+  "what": ["which","who","what is"],
+  "who": ["what","which"],
+  "when": ["date","time","on"],
+  "where": ["location","place","address"],
+};
+function expandTerms(rawTerms){
+  const expanded = new Set(rawTerms);
+  for(const t of rawTerms){
+    const syns = SYNONYMS[t];
+    if(syns) for(const s of syns) expanded.add(s);
+  }
+  return [...expanded];
+}
+// Keyword scorer: split query into words, score each doc by word match in
+// flat text (1x) and headings (2x). Return top-3 with their content.
+// FIXED (Nov 4): stop-word filter + synonym expansion so natural-language
+// queries actually find the facts stored under different words.
 function ragSearch(query, indexData, topK=3){
   if(!indexData || !indexData.docs) return [];
-  const terms = query.toLowerCase().replace(/[^a-z0-9\\s]/g," ").split(/\s+/).filter(Boolean);
+  const rawTerms = query.toLowerCase().replace(/[^a-z0-9\\s]/g," ").split(/\s+/).filter(Boolean);
+  // Filter out stop words and single-char tokens
+  const terms = rawTerms.filter(t => !STOP_WORDS.has(t) && t.length > 1);
   if(!terms.length) return [];
+  // Expand: each raw term brings its synonyms into the search
+  const allTerms = expandTerms(terms);
   const scored = indexData.docs.map(d => {
     let score = 0;
     // headings get 2x weight
     const hLower = (d.headings||[]).join(" ").toLowerCase();
-    for(const t of terms){ if(hLower.includes(t)) score += 2; }
+    for(const t of allTerms){ if(hLower.includes(t)) score += 2; }
     // body gets 1x
     const f = d.flat || "";
-    for(const t of terms){
+    for(const t of allTerms){
       let idx = 0;
       while((idx = f.indexOf(t, idx)) !== -1){ score += 1; idx += t.length; }
     }
