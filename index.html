@@ -97,7 +97,7 @@
 // TR's Tailscale IP — reachable from cell data anywhere, even when home Wi-Fi is off.
 // ?host= still wins for a one-off override.
 const _qhost = new URLSearchParams(location.search).get("host");
-const TR = _qhost ? ("http://" + _qhost) : "http://100.89.255.66:18900";
+const TR = _qhost ? ("http://" + _qhost) : "https://rayvaluniverse.taile9b2c.ts.net";
 
 // ---- the cloud brain (direct-to-cloud chat, no TR in the path) ----------
 // The phone page talks straight to the Agnes hub. TR can be fully off and the
