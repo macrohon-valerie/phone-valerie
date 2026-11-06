@@ -201,10 +201,16 @@ async function doLeave(){
   }
   try{
     const r = await fetch(TR+"/grab", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}", signal: AbortSignal.timeout(45000)});
-    const ct = r.headers.get("content-type")||"";
+    // server gzips /grab; decompress before parsing
     let j;
-    if(ct.includes("json")){ j = await r.json(); }
-    else { const txt = await r.text(); throw new Error("non-JSON response ("+r.status+"): "+txt.slice(0,120)); }
+    if (r.headers.get("content-encoding") === "gzip") {
+      const buf = await r.arrayBuffer();
+      j = JSON.parse(new TextDecoder().decode(buf));
+    } else {
+      const ct = r.headers.get("content-type")||"";
+      if(ct.includes("json")){ j = await r.json(); }
+      else { const txt = await r.text(); throw new Error("non-JSON response ("+r.status+"): "+txt.slice(0,120)); }
+    }
     if(!j.ok) throw new Error(j.err||"grab failed");
     localStorage.setItem(GRAB_KEY, JSON.stringify({stamp:j.stamp, files:j.files}));
     // verify: we actually hold today-dated content, non-zero
