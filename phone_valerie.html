@@ -200,8 +200,11 @@ async function doLeave(){
     setBusy(false); return;
   }
   try{
-    const r = await fetch(TR+"/grab", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    const j = await r.json();
+    const r = await fetch(TR+"/grab", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}", signal: AbortSignal.timeout(45000)});
+    const ct = r.headers.get("content-type")||"";
+    let j;
+    if(ct.includes("json")){ j = await r.json(); }
+    else { const txt = await r.text(); throw new Error("non-JSON response ("+r.status+"): "+txt.slice(0,120)); }
     if(!j.ok) throw new Error(j.err||"grab failed");
     localStorage.setItem(GRAB_KEY, JSON.stringify({stamp:j.stamp, files:j.files}));
     // verify: we actually hold today-dated content, non-zero
@@ -319,17 +322,47 @@ async function sendChat(){
   cinp.value="";
   addMsg("me", text);
   chatHistory.push({role:"user", content:text});
-  const st = $("chatStatus"); st.textContent="… Valerie's thinking (direct to cloud, no house needed)";
-  // also log this line to the diary (the phone keeps its own day even out here)
+  const st = $("chatStatus");
   window.valerieDiary.line("me", text);
+
+  // Build the message payload the same way TR's /chat does it.
+  // When house is up we route through /chat which injects web_search tools.
+  // When house is off we call cloud directly (no tools, works on cellular).
+  const msgs = [{role:"system", content:CLOUD_BASELINE}, ...chatHistory];
+
+  // Try TR /chat first (has tools + smart baseline)
   try{
-    // DIRECT-TO-CLOUD: the phone page calls the Agnes hub itself. No TR, no /chat
-    // front-end on the house. TR can be fully off and this still works.
-    const msgs = [{role:"system", content:CLOUD_BASELINE}, ...chatHistory];
+    const houseUp = await trUp();
+    if(houseUp){
+      st.textContent = "… Valerie's thinking (via house, search enabled)";
+      const r = await fetch(TR+"/chat", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({history: chatHistory})
+      });
+      if(r.ok){
+        const j = await r.json();
+        if(j.ok){
+          addMsg("valerie", j.reply);
+          chatHistory.push({role:"assistant", content:j.reply});
+          window.valerieDiary.line("valerie", j.reply);
+          st.textContent="";
+          return;
+        }
+      }
+      throw new Error("TR /chat returned err: "+(j.err||r.status));
+    }
+  }catch(e){
+    // House unreachable or /chat failed — fall through to direct cloud
+    st.textContent = "… Valerie's thinking (direct to cloud, house off)";
+  }
+
+  // Fallback: direct-to-cloud, no tools (cellular / house-off mode)
+  try{
     const r = await fetch(CLOUD_API + "/chat/completions", {
       method:"POST",
-      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+CLOUD_KEY },
-      body: JSON.stringify({ model:CLOUD_MODEL, messages:msgs, max_tokens:400 })
+      headers:{"Content-Type":"application/json", "Authorization":"Bearer "+CLOUD_KEY},
+      body:JSON.stringify({model:CLOUD_MODEL, messages:msgs, max_tokens:400})
     });
     if(!r.ok){ const t = await r.text().catch(()=>r.status); throw new Error("cloud "+r.status+" "+t); }
     const j = await r.json();
@@ -340,7 +373,7 @@ async function sendChat(){
     window.valerieDiary.line("valerie", reply);
     st.textContent="";
   }catch(e){
-    addMsg("valerie", "⚠️ couldn't reach the cloud right now ("+e.message+"). Check your connection and try again.");
+    addMsg("valerie", "⚠️ couldn't reach Valerie right now ("+e.message+"). Check your connection and try again.");
     st.textContent="";
   }
 }
