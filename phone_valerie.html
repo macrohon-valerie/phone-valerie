@@ -164,18 +164,18 @@ function renderDiary(){
 // for the two sync buttons (leave/home). They are reported SEPARATELY now, so
 // Ray can see the chat will work even when the house is off.
 async function trUp(){
-  try{ const r = await fetch(TR+"/health", {cache:"no-store"});
+  try{ const r = await fetch(TR+"/health", {cache:"no-store", signal: AbortSignal.timeout(10000)});
        const j = await r.json(); return j.ok===true; }
-  catch(e){ return false; }
+  catch(e){ console.warn("check failed:", e.message); return false; }
 }
 async function cloudUp(){
   // cheap: OPTIONS-free; just confirm the endpoint is reachable & authorized
   try{
-    const r = await fetch(CLOUD_API+"/chat/completions",{method:"POST",
+    const r = await fetch(CLOUD_API+"/chat/completions", {method:"POST", signal: AbortSignal.timeout(10000),
       headers:{"Content-Type":"application/json","Authorization":"Bearer "+CLOUD_KEY},
       body: JSON.stringify({model:CLOUD_MODEL, messages:[{role:"user",content:"."}], max_tokens:1})});
     return r.ok;
-  }catch(e){ return false; }
+  }catch(e){ console.warn("check failed:", e.message); return false; }
 }
 async function refreshLink(){
   const house = await trUp();
@@ -210,7 +210,7 @@ async function doLeave(){
     // verify: we actually hold today-dated content, non-zero
     const hasToday = Object.keys(j.files).some(k=>k.includes(todayStr()));
     ok(`✅ leaving-synced — phone now holds the house diary: ${j.file_count} pages, ${Math.round(j.bytes/1024)} KB, up to ${j.stamp.slice(0,10)}${hasToday?" (today included ✓)":""}.`);
-  }catch(e){ fail("❌ grab failed ("+e.message+") — nothing pulled, nothing changed. Try again."); }
+  }catch(e){ console.error("grab error:", e); fail("❌ grab failed ("+e.message+") — nothing pulled, nothing changed. Try again."); }
   setBusy(false);
 }
 
@@ -249,7 +249,7 @@ async function doHome(){
       localStorage.setItem(GRAB_KEY, JSON.stringify({stamp:j.stamp, files:j.pull_payload}));
     const pushed = (j.phone_days_pushed||[]).filter(k=>k.startsWith("memory/phone/")).length;
     ok(`✅ home-synced — handed the house ${pushed} phone-day(s); house had ${j.house_files_pulled_back} newer/different pages, now on the phone${j.conflicts_resolved_newest_wins.length?` · ${j.conflicts_resolved_newest_wins.length} conflict(s) resolved newest-wins`:""}. All-or-nothing held.`);
-  }catch(e){ fail("❌ merge failed — the house rolled back, both sides untouched. Phone-day still safe here. ("+e.message+")"); }
+  }catch(e){ console.error("merge error:", e); fail("❌ merge failed — the house rolled back, both sides untouched. Phone-day still safe here. ("+e.message+")"); }
   setBusy(false);
 }
 
