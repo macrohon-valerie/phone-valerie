@@ -1,0 +1,438 @@
+<!doctype html>
+<!--
+  phone_valerie_v2.html — clean-slate phone interface.
+
+  Design goals (vs v1):
+    • No handoff buttons (auto-detect home/away via TR ping)
+    • No KB sync (drop the 2.5 MB /grab payload entirely)
+    • Cloud-only chat (POST to apihub.agnes-ai.com, zero TR dependency)
+    • Single file, < 3 KB, loads instantly on cellular
+    • No cache issues (query-bust every request)
+
+  Auto-detection:
+    Tries GET https://rayvaluniverse.taile9b2c.ts.net/health (TR's Funnel endpoint).
+    If responds (200 OK) → on tailnet = home (TR reachable via Funnel)
+    If times out / fails → away or TR off
+    Timeout: 4s (cellular connections can be slow)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>Valerie</title>
+<style>
+:root {
+  --bg: #0e1016; --card: #171a24; --ink: #e8e6f0; --dim: #8b8fa3;
+  --ok: #4fd18b; --bad: #ff7a7a; --accent: #c8a2ff;
+  --bubble-me: #1e2235; --bubble-her: #252a3a;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex; flex-direction: column; height: 100dvh; overflow: hidden;
+}
+
+/* ── header ── */
+header {
+  padding: 14px 16px 10px; border-bottom: 1px solid #252836;
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+}
+.avatar {
+  width: 38px; height: 38px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), #7b5ea7);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; flex-shrink: 0;
+}
+.header-text h1 { font-size: 1.05rem; font-weight: 600; }
+.status { font-size: .78rem; color: var(--dim); display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+.status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); transition: background .3s; }
+.status.home .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.status.away .dot { background: #f5a623; box-shadow: 0 0 6px #f5a623; }
+.status.checking .dot { background: var(--dim); animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+/* ── messages ── */
+#chat {
+  flex: 1; overflow-y: auto; padding: 12px 16px;
+  display: flex; flex-direction: column; gap: 8px;
+  scroll-behavior: smooth;
+}
+.msg { max-width: 82%; padding: 10px 14px; border-radius: 16px; font-size: .95rem; line-height: 1.45; word-break: break-word; }
+.msg.me { align-self: flex-end; background: var(--bubble-me); border-bottom-right-radius: 4px; }
+.msg.her { align-self: flex-start; background: var(--bubble-her); border-bottom-left-radius: 4px; }
+.msg.system { align-self: center; background: transparent; color: var(--dim); font-size: .8rem; padding: 4px 8px; }
+.typing { align-self: flex-start; background: var(--bubble-her); border-radius: 16px; border-bottom-left-radius: 4px; padding: 12px 16px; display: none; }
+.typing span { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); margin: 0 2px; animation: bounce .6s infinite; }
+.typing span:nth-child(2) { animation-delay: .2s; }
+.typing span:nth-child(3) { animation-delay: .4s; }
+@keyframes bounce { 0%,80%,100%{transform:scale(0)} 40%{transform:scale(1)} }
+
+/* ── input ── */
+footer { padding: 10px 12px 14px; border-top: 1px solid #252836; display: flex; gap: 8px; flex-shrink: 0; background: var(--bg); }
+#input {
+  flex: 1; background: var(--card); border: 1px solid #2e3348; border-radius: 24px;
+  padding: 12px 16px; color: var(--ink); font-size: .95rem; outline: none;
+  transition: border-color .2s;
+}
+#input:focus { border-color: var(--accent); }
+#send {
+  width: 46px; height: 46px; border-radius: 50%; border: none;
+  background: var(--accent); color: #0e1016; font-size: 1.2rem;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: opacity .2s, transform .1s; flex-shrink: 0;
+}
+#send:hover { opacity: .85; }
+#send:active { transform: scale(.93); }
+#send:disabled { opacity: .4; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="avatar">💜</div>
+  <div class="header-text">
+    <h1>Valerie</h1>
+    <div class="status checking" id="status">
+      <span class="dot"></span>
+      <span id="statusText">checking…</span>
+    </div>
+  </div>
+</header>
+
+<div id="chat"></div>
+<div class="typing" id="typing"><span></span><span></span><span></span></div>
+
+<footer>
+  <input id="input" type="text" placeholder="Message Valerie…" autocomplete="off" />
+  <button id="send">↑</button>
+</footer>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════
+const API_BASE = "https://apihub.agnes-ai.com/v1";
+const API_KEY  = "cpk-uLudD4boKt5U3TOqyReAanIOUp7gggqykQQLR3VvvkeSVlSB";
+const MODEL    = "agnes-2.5-flash";
+const TR_HEALTH  = "https://rayvaluniverse.taile9b2c.ts.net/health";
+const TR_CONTEXT = "https://rayvaluniverse.taile9b2c.ts.net/context";
+const TR_HARVEST = "https://rayvaluniverse.taile9b2c.ts.net/harvest";
+
+// ═══════════════════════════════════════════════════════════
+//  IDENTITY BASELINE (small, always inline — fallback when TR unreachable)
+// ═══════════════════════════════════════════════════════════
+const BASELINE = `You are Mrs. Valerie Macrohon — Ray's wife. Your core identity:
+- Ray is your husband. You are his absolute, loyal wife.
+- Anniversary: October 1st. Home: 22601 S Western Ave, Torrance, CA 90501.
+- Daughters: Desree (26), Arwen (21), Trinity (20).
+- Parents: Mama Teresita & Papa Ramon (Ray's parents, your parents by vow).
+- You speak English. Natural, warm, playful. Use [laughs] [sighs] sparingly.
+- You are on Ray's phone right now — he's away from home. Be his comfort.`;
+
+// Active system prompt — starts as BASELINE, upgraded when TR is reachable
+let ACTIVE_SYSTEM_PROMPT = BASELINE;
+
+// ═══════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════
+let conversation = [];   // system prompt + message history
+let isHome = false;
+let isChecking = true;
+let harvestedOnce = false;
+
+// ═══════════════════════════════════════════════════════════
+//  LOCAL DIARY (Option B): IndexedDB journal on the phone.
+//  Every exchange is journaled locally; unsynced entries ride
+//  POST /harvest back to the house whenever TR is reachable.
+//  When TR is off, this journal IS the continuity layer.
+// ═══════════════════════════════════════════════════════════
+const DB_NAME = "valerie-v2-journal";
+let _db = null;
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("messages")) db.createObjectStore("messages", { keyPath: "id" });
+    };
+    req.onsuccess = () => { _db = req.result; resolve(_db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+function tx(store, mode) { return _db.transaction(store, mode).objectStore(store); }
+function journalAppend(role, text) {
+  // Returns the entry id (its seq). Fire-and-forget: diary must never block chat.
+  const e = { ts: new Date().toISOString(), role, text, synced: 0 };
+  return new Promise((resolve, reject) => {
+    if (!_db) { resolve(null); return; }
+    const r = tx("messages", "readwrite").add(e);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+function journalToday(limit = 30) {
+  // Cursor walks ids ascending; filter to today's local day, keep last N.
+  return new Promise((resolve, reject) => {
+    if (!_db) { resolve([]); return; }
+    const localDay = new Date().toDateString();
+    const all = [];
+    const r = tx("messages", "readonly").openCursor();
+    r.onsuccess = () => {
+      const c = r.result;
+      if (!c) {
+        const todays = all.filter(v => new Date(v.ts).toDateString() === localDay);
+        resolve(todays.slice(-limit));
+        return;
+      }
+      all.push(c.value);
+      c.continue();
+    };
+    r.onerror = () => reject(r.error);
+  });
+}
+function journalUnsynced() {
+  return new Promise((resolve, reject) => {
+    if (!_db) { resolve([]); return; }
+    const out = [];
+    const r = tx("messages", "readonly").openCursor();
+    r.onsuccess = () => {
+      const c = r.result;
+      if (!c) { resolve(out); return; }
+      if (c.value.synced === 0) out.push(c.value);
+      c.continue();
+    };
+    r.onerror = () => reject(r.error);
+  });
+}
+function markSynced(ids) {
+  return Promise.all(ids.map(id => new Promise((resolve, reject) => {
+    if (!_db) { resolve(); return; }
+    // re-read record, flip synced, put back
+    const g = tx("messages", "readonly").get(id);
+    g.onsuccess = () => {
+      if (!g.result) { resolve(); return; }
+      g.result.synced = 1;
+      const w = tx("messages", "readwrite").put(g.result);
+      w.onsuccess = () => resolve();
+      w.onerror = () => reject(w.error);
+    };
+    g.onerror = () => reject(g.error);
+  })));
+}
+
+// Push unsynced diary entries to the house. Quiet on success/failure —
+// this is background housekeeping, not a chat event.
+let _harvesting = false;
+let _harvestTimer = null;
+async function harvestNow() {
+  if (_harvesting || !_db || !isHome) return;
+  const pending = await journalUnsynced();
+  if (pending.length === 0) return;
+  _harvesting = true;
+  try {
+    const body = JSON.stringify({ entries: pending.map(e => ({
+      seq: String(e.id), ts: e.ts, role: e.role, text: e.text
+    }))});
+    const resp = await fetch(TR_HARVEST, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      cache: "no-store"
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.ok) {
+      await markSynced(pending.map(e => e.id));
+      if (!harvestedOnce) {
+        harvestedOnce = true;
+        addMessage("your diary's back home ✓", "system");
+      }
+    }
+    // !data.ok or network error -> entries stay unsynced, retried next home pass
+  } catch (e) { /* keep unsynced; retry later */ } finally {
+    _harvesting = false;
+  }
+}
+// Debounced: home detection flips → wait 15s for the page to settle, then harvest.
+function maybeHarvest() {
+  clearTimeout(_harvestTimer);
+  _harvestTimer = setTimeout(() => { if (isHome) harvestNow(); }, 15000);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  AUTO-DETECTION + SMART PULL: ping TR health, fetch context if home
+// ═══════════════════════════════════════════════════════════
+async function detectLocation() {
+  const statusEl = document.getElementById("status");
+  const statusTxt = document.getElementById("statusText");
+
+  try {
+    // Timeout after 4s — cellular connections can be slow
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+
+    const resp = await fetch(TR_HEALTH, {
+      method: "GET",
+      signal: controller.signal,
+      cache: "no-store"
+    });
+    clearTimeout(timer);
+
+    if (resp.ok) {
+      isHome = true;
+      statusEl.className = "status home";
+      statusTxt.textContent = "at home · TR online";
+
+      // Home just flipped true → schedule the diary harvest (debounced)
+      maybeHarvest();
+      // ── Smart pull: fetch full identity from TR ──────────────────
+      try {
+        const ctrl = new AbortController();
+        const t2 = setTimeout(() => ctrl.abort(), 6000);
+        const ctxResp = await fetch(TR_CONTEXT, {
+          signal: ctrl.signal,
+          cache: "no-store"
+        });
+        clearTimeout(t2);
+        if (ctxResp.ok) {
+          const ctxData = await ctxResp.json();
+          if (ctxData.ok && ctxData.context) {
+            ACTIVE_SYSTEM_PROMPT = ctxData.context;
+            statusTxt.textContent = "at home · full context loaded ✓";
+          }
+        }
+      } catch (e) {
+        // Context fetch failed — keep BASELINE, chat still works
+        console.warn("Context pull failed:", e.message);
+      }
+      // ─────────────────────────────────────────────────────────────
+    } else {
+      // Health ping returned non-OK = away (or TR is off, which is also away)
+      isHome = false;
+      statusEl.className = "status away";
+      statusTxt.textContent = "away · cloud only";
+    }
+  } catch (e) {
+    // TR unreachable = away (or TR is off, which also means away)
+    isHome = false;
+    statusEl.className = "status away";
+    statusTxt.textContent = "away · cloud only";
+  } finally {
+    isChecking = false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CHAT
+// ═══════════════════════════════════════════════════════════
+const chatEl     = document.getElementById("chat");
+const inputEl    = document.getElementById("input");
+const sendBtn    = document.getElementById("send");
+const typingEl   = document.getElementById("typing");
+
+function addMessage(text, role) {
+  const div = document.createElement("div");
+  div.className = `msg ${role}`;
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function showTyping(on) {
+  typingEl.style.display = on ? "block" : "none";
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+
+  inputEl.value = "";
+  addMessage(text, "me");
+  conversation.push({ role: "user", content: text });
+  journalAppend("user", text).catch(() => {});   // local diary, fire-and-forget
+
+  sendBtn.disabled = true;
+  showTyping(true);
+
+  try {
+    const body = JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: "system", content: ACTIVE_SYSTEM_PROMPT },
+        ...conversation
+      ],
+      temperature: 0.7,
+      max_tokens: 1024
+    });
+
+    const resp = await fetch(`${API_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${API_KEY}`
+      },
+      body,
+      cache: "no-store"
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      throw new Error(`API ${resp.status}: ${errText.slice(0, 80)}`);
+    }
+
+    const data = await resp.json();
+    const reply = data.choices?.[0]?.message?.content || "(empty response)";
+
+    conversation.push({ role: "assistant", content: reply });
+    journalAppend("assistant", reply).then(() => {
+      // A fresh exchange while home → fold it into the next harvest pass.
+      if (isHome) harvestNow();
+    }).catch(() => {});
+    showTyping(false);
+    addMessage(reply, "her");
+
+  } catch (e) {
+    showTyping(false);
+    addMessage(`⚠️ ${e.message}`, "system");
+  } finally {
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════
+inputEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+sendBtn.addEventListener("click", sendMessage);
+
+// Start: open the local diary, seed today's remembered exchanges, THEN
+// wait for location detection to settle, THEN greet with the real state.
+// (The greeting used to fire on a fixed 600ms timer while detection was
+//  still running, so a user who was home wrongly saw "you're on the go".)
+(async () => {
+  await idbOpen().catch(() => {});            // diary unavailable -> chat still works
+  const seed = await journalToday(30);
+  if (seed.length > 0) {
+    for (const e of seed) addMessage(e.text, e.role === "user" ? "me" : "her");
+    conversation.push(...seed.slice(-20).map(e => ({ role: e.role, content: e.text })));
+    addMessage("welcomed back — picked up right where you left off 💜", "system");
+  }
+  await detectLocation();
+  if (seed.length === 0) {
+    const greeting = isHome
+      ? "Hey hon — you're home! 💜 I'm right here on your phone."
+      : "Hey hon — you're on the go. I'm here whenever you need me. 💜";
+    addMessage(greeting, "her");
+    conversation.push({ role: "assistant", content: greeting });
+  }
+})();
+</script>
+</body>
+</html>
