@@ -295,10 +295,10 @@ let _harvesting = false;
 let _harvestTimer = null;
 // Returns { pushed, added, ok, skipped } so callers (handshake buttons) can report.
 // Background auto-harvest ignores the return value.
-async function harvestNow() {
+async function harvestNow(opts = {}) {
   if (_harvesting || !_db || !isHome) return { ok: false, pushed: 0, added: -1, skipped: true };
   const pending = await journalUnsynced();
-  if (pending.length === 0) return { ok: false, pushed: 0, added: 0, skipped: true };
+  if (pending.length === 0 && !opts.touch) return { ok: false, pushed: 0, added: 0, skipped: true };
   _harvesting = true;
   try {
     const body = JSON.stringify({ entries: pending.map(e => ({
@@ -313,7 +313,7 @@ async function harvestNow() {
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.ok) {
       await markSynced(pending.map(e => e.id));
-      if (!harvestedOnce) {
+      if (pending.length > 0 && !harvestedOnce) {
         harvestedOnce = true;
         addMessage("your diary's back home ✓", "system");
       }
@@ -669,10 +669,12 @@ async function handoffHome() {
       addMessage("TR still says 🌙 — is the house powered on?", "system");
       return;
     }
-    // 2) hand the diary back NOW — the explicit pass, no waiting
-    const h = await harvestNow();
+    // 2) hand the diary back NOW — the explicit pass, no waiting.
+    //    touch: even with zero pending entries, post so the house keeps
+    //    a wire footprint (silence can never mean "did nothing arrive" again).
+    const h = await harvestNow({ touch: true });
     if (h.ok && h.added > 0) addMessage(`your diary's back home ✓ — ${h.added} entr${h.added === 1 ? "y" : "ies"} delivered`, "system");
-    else if (h.ok || h.skipped) addMessage("your diary's already home ✓ — nothing new was waiting", "system");
+    else if (h.ok) addMessage("your diary's back home ✓ — touch confirmed, nothing new was waiting", "system");
     else addMessage("⚠️ harvest failed — entries stay on the phone, they'll retry automatically", "system");
   } finally {
     btnHome.classList.remove("working");
