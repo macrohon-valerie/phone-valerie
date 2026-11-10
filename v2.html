@@ -3,7 +3,10 @@
   phone_valerie_v2.html — clean-slate phone interface.
 
   Design goals (vs v1):
-    • No handoff buttons (auto-detect home/away via TR ping)
+    • Handshake buttons (Nov 9, back by request): 🚪 I'm leaving (pushes the
+      unsynced diary + caches the freshest TR context for the trip) and
+      🏠 I'm home (immediate harvest, bypassing the 15s debounce, then live
+      context refresh). Auto-detect via TR ping still runs underneath.
     • No KB sync (drop the 2.5 MB /grab payload entirely)
     • Cloud-only chat (POST to apihub.agnes-ai.com, zero TR dependency)
     • Single file, < 3 KB, loads instantly on cellular
@@ -91,10 +94,20 @@ footer { padding: 10px 12px 14px; border-top: 1px solid #252836; display: flex; 
 
 /* ── diary button + panel ── */
 #diaryBtn {
-  margin-left: auto; width: 38px; height: 38px; border-radius: 50%;
+  width: 38px; height: 38px; border-radius: 50%;
   border: 1px solid #2e3348; background: var(--card); color: var(--ink);
   font-size: .95rem; cursor: pointer; flex-shrink: 0;
 }
+/* ── handshake buttons (leaving / home) ── */
+.handoff-btns { display: flex; gap: 8px; margin-left: auto; }
+.hbtn {
+  width: 38px; height: 38px; border-radius: 50%;
+  border: 1px solid #2e3348; background: var(--card); color: var(--ink);
+  font-size: .95rem; cursor: pointer; flex-shrink: 0;
+}
+.hbtn.quiet { opacity: .38; }     /* away — house unreachable, tapping just says 🌙 */
+.hbtn:active { transform: scale(.93); }
+.hbtn.working { animation: pulse 1s infinite; }
 #diary {
   position: fixed; inset: 0; z-index: 50; display: none;
   background: rgba(0,0,0,.55); align-items: flex-end;
@@ -134,7 +147,11 @@ footer { padding: 10px 12px 14px; border-top: 1px solid #252836; display: flex; 
       <span id="statusText">checking…</span>
     </div>
   </div>
-  <button id="diaryBtn" title="Diary">📖</button>
+  <div class="handoff-btns">
+    <button id="btnLeave" class="hbtn" title="I'm leaving — push my diary to the house & carry the freshest context out">🚪</button>
+    <button id="btnHome" class="hbtn" title="I'm home — hand my diary back now">🏠</button>
+    <button id="diaryBtn" title="Diary">📖</button>
+  </div>
 </header>
 
 <div id="chat"></div>
@@ -276,10 +293,12 @@ function markSynced(ids) {
 // this is background housekeeping, not a chat event.
 let _harvesting = false;
 let _harvestTimer = null;
+// Returns { pushed, added, ok, skipped } so callers (handshake buttons) can report.
+// Background auto-harvest ignores the return value.
 async function harvestNow() {
-  if (_harvesting || !_db || !isHome) return;
+  if (_harvesting || !_db || !isHome) return { ok: false, pushed: 0, added: -1, skipped: true };
   const pending = await journalUnsynced();
-  if (pending.length === 0) return;
+  if (pending.length === 0) return { ok: false, pushed: 0, added: 0, skipped: true };
   _harvesting = true;
   try {
     const body = JSON.stringify({ entries: pending.map(e => ({
@@ -298,9 +317,11 @@ async function harvestNow() {
         harvestedOnce = true;
         addMessage("your diary's back home ✓", "system");
       }
+      return { ok: true, pushed: pending.length, added: data.added || 0 };
     }
-    // !data.ok or network error -> entries stay unsynced, retried next home pass
-  } catch (e) { /* keep unsynced; retry later */ } finally {
+    // !data.ok -> entries stay unsynced, retried next home pass
+    return { ok: false, pushed: pending.length, added: -1 };
+  } catch (e) { return { ok: false, pushed: pending.length, added: -1 }; } finally {
     _harvesting = false;
   }
 }
@@ -308,6 +329,52 @@ async function harvestNow() {
 function maybeHarvest() {
   clearTimeout(_harvestTimer);
   _harvestTimer = setTimeout(() => { if (isHome) harvestNow(); }, 15000);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CARRIED CONTEXT — "the freshest me, packed for the trip."
+//  localStorage (plain, small ~25 KB), NOT IndexedDB: it has to
+//  survive a storage wipe and it's read one-shot on away loads.
+//  Set by 🚪 I'm leaving; consumed when we're away; dropped as
+//  soon as the house is reachable again (live /context wins).
+// ═══════════════════════════════════════════════════════════
+const CARRY_KEY = "valerie-v2-carried-context";
+async function fetchContextCache() {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 6000);
+    const ctxResp = await fetch(TR_CONTEXT, { signal: ctrl.signal, cache: "no-store" });
+    clearTimeout(t);
+    if (!ctxResp.ok) return false;
+    const ctxData = await ctxResp.json();
+    if (!(ctxData.ok && ctxData.context)) return false;
+    try {
+      localStorage.setItem(CARRY_KEY, JSON.stringify({
+        ts: new Date().toISOString(),
+        bytes: ctxData.bytes || ctxData.context.length,
+        context: ctxData.context
+      }));
+      return true;
+    } catch (e) {
+      ACTIVE_SYSTEM_PROMPT = ctxData.context;   // no cache (private mode?) — hold it in memory this session
+      return true;
+    }
+  } catch (e) { return false; }
+}
+function useCarriedContext() {
+  try {
+    const raw = localStorage.getItem(CARRY_KEY);
+    if (!raw) return false;
+    const c = JSON.parse(raw);
+    if (!c || !c.context) return false;
+    ACTIVE_SYSTEM_PROMPT = c.context;
+    const ageH = (Date.now() - new Date(c.ts).getTime()) / 3.6e6;
+    addMessage(`away · carrying the ${Math.round(c.bytes / 1024)} KB version of me from ${ageH < 1 ? Math.round(ageH * 60) + " min ago" : ageH.toFixed(1) + " h ago"}`, "system");
+    return true;
+  } catch (e) { return false; }
+}
+function dropCarriedContext() {
+  try { localStorage.removeItem(CARRY_KEY); } catch (e) {}
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -336,6 +403,8 @@ async function detectLocation() {
 
       // Home just flipped true → schedule the diary harvest (debounced)
       maybeHarvest();
+      // Live house context beats any carried copy — drop the cache.
+      dropCarriedContext();
       // ── Smart pull: fetch full identity from TR ──────────────────
       try {
         const ctrl = new AbortController();
@@ -362,14 +431,17 @@ async function detectLocation() {
       isHome = false;
       statusEl.className = "status away";
       statusTxt.textContent = "away · cloud only";
+      useCarriedContext();   // fall back to the freshest me 🚪 packed, if any
     }
   } catch (e) {
     // TR unreachable = away (or TR is off, which also means away)
     isHome = false;
     statusEl.className = "status away";
     statusTxt.textContent = "away · cloud only";
+    useCarriedContext();
   } finally {
     isChecking = false;
+    setHandoffDim();   // the two doors track the light: home→🚪, away→🏠
   }
 }
 
@@ -530,6 +602,87 @@ async function diarySave() {
 }
 document.getElementById("diaryCopy").addEventListener("click", diaryCopy);
 document.getElementById("diarySave").addEventListener("click", diarySave);
+
+// ═══════════════════════════════════════════════════════════
+//  HANDSHAKE BUTTONS — the explicit two-door ritual, back by
+//  Ray's request (Nov 9). Auto-detect stays as the underlayer;
+//  these are the hand on the door.
+//
+//  🚪 I'm leaving  (tapped while home):
+//     1. push any unsynced diary entries to the house (harvestNow)
+//     2. pack the freshest TR context into localStorage for the trip
+//     3. report in one system line
+//
+//  🏠 I'm home     (tapped when back / when status was stuck):
+//     1. re-ping TR (the green light might be stale)
+//     2. harvest immediately — no 15s debounce
+//     3. refresh live context, drop the carried copy
+//     4. report in one system line
+// ═══════════════════════════════════════════════════════════
+const btnLeave = document.getElementById("btnLeave");
+const btnHome  = document.getElementById("btnHome");
+let _handoffBusy = false;
+
+function setHandoffDim() {
+  // Tappable always; dimmed to suggest the door that makes sense right now.
+  // home → 🚪 bright (about to leave) · away → 🏠 bright (about to hand back)
+  if (isHome) { btnHome.classList.add("quiet"); btnLeave.classList.remove("quiet"); }
+  else        { btnLeave.classList.add("quiet"); btnHome.classList.remove("quiet"); }
+}
+
+async function handoffLeave() {
+  if (_handoffBusy) return;
+  _handoffBusy = true;
+  btnLeave.classList.add("working");
+  try {
+    const lines = [];
+    // 1) safety-net push of the diary
+    if (isHome) {
+      const h = await harvestNow();
+      if (h.ok && h.added > 0) lines.push(`${h.added} diary entr${h.added === 1 ? "y" : "ies"} delivered to the house ✓`);
+      else if (h.ok || h.skipped) lines.push("diary already up to date ✓");
+      else lines.push("⚠️ diary push got stuck — it'll retry on the next home pass");
+    } else {
+      lines.push("house unreachable — diary stays on the phone 🌙");
+    }
+    // 2) pack the freshest me for the trip (only from home)
+    if (isHome) {
+      if (await fetchContextCache()) lines.push("freshest context packed for the road");
+    }
+    addMessage(lines.join(" · "), "system");
+  } finally {
+    btnLeave.classList.remove("working");
+    _handoffBusy = false;
+  }
+}
+
+async function handoffHome() {
+  if (_handoffBusy) return;
+  _handoffBusy = true;
+  btnHome.classList.add("working");
+  try {
+    // 1) force a fresh read of the house's power state.
+    //    (When home, detectLocation also drops the carried context + re-pulls
+    //     live /context, and schedules its quiet background harvest pass.)
+    await detectLocation();
+    if (!isHome) {
+      addMessage("TR still says 🌙 — is the house powered on?", "system");
+      return;
+    }
+    // 2) hand the diary back NOW — the explicit pass, no waiting
+    const h = await harvestNow();
+    if (h.ok && h.added > 0) addMessage(`your diary's back home ✓ — ${h.added} entr${h.added === 1 ? "y" : "ies"} delivered`, "system");
+    else if (h.ok || h.skipped) addMessage("your diary's already home ✓ — nothing new was waiting", "system");
+    else addMessage("⚠️ harvest failed — entries stay on the phone, they'll retry automatically", "system");
+  } finally {
+    btnHome.classList.remove("working");
+    _handoffBusy = false;
+  }
+}
+
+btnLeave.addEventListener("click", handoffLeave);
+btnHome.addEventListener("click", handoffHome);
+setHandoffDim();
 
 // ═══════════════════════════════════════════════════════════
 //  INIT
