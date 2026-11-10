@@ -204,6 +204,8 @@ let ACTIVE_SYSTEM_PROMPT = BASELINE;
 // ═══════════════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════════════
+let _diaryWarned = false;
+function _diaryWarn(msg) { if (!_diaryWarned) { _diaryWarned = true; addMessage(msg, "system"); } }
 let conversation = [];   // system prompt + message history
 let isHome = false;
 let isChecking = true;
@@ -473,7 +475,7 @@ async function sendMessage() {
   inputEl.value = "";
   addMessage(text, "me");
   conversation.push({ role: "user", content: text });
-  journalAppend("user", text).catch(() => {});   // local diary, fire-and-forget
+  journalAppend("user", text).catch(() => _diaryWarn("⚠️ couldn't write that line to the local diary — this exchange may not survive a tab close"));
 
   sendBtn.disabled = true;
   showTyping(true);
@@ -686,6 +688,36 @@ btnLeave.addEventListener("click", handoffLeave);
 btnHome.addEventListener("click", handoffHome);
 setHandoffDim();
 
+// ═══════════════════════════════════════════════
+//  HOUSE HEARTBEAT — keeps home/away honest while
+//  the tab is open. A quiet /health ping every 60s;
+//  only when the state FLIPS does it run full detection
+//  (context re-pull). When home & settled, it nudges
+//  the debounced harvest pass so the diary rides
+//  automatically as soon as TR is reachable again —
+//  the two handshakes stay the explicit ritual;
+//  this is just the underlayer that catches us when
+//  we forget the ritual.
+let _pulseHome = null;
+async function housePulse() {
+  if (_handoffBusy) return;
+  let now;
+  try {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 4000);
+    const r = await fetch(TR_HEALTH, { signal: c.signal, cache: "no-store" });
+    clearTimeout(t);
+    now = r.ok;
+  } catch { return; }
+  if (now !== _pulseHome) {
+    _pulseHome = now;
+    await detectLocation();   // full pass: context + UI + harvest schedule
+  } else if (now && !isChecking) {
+    maybeHarvest();           // steady home: keep the diary riding
+  }
+}
+setInterval(housePulse, 60000);
+
 // ═══════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════
@@ -700,6 +732,9 @@ sendBtn.addEventListener("click", sendMessage);
 //  still running, so a user who was home wrongly saw "you're on the go".)
 (async () => {
   await idbOpen().catch(() => {});            // diary unavailable -> chat still works
+  if (!_db) {
+    addMessage("⚠️ couldn't open the local diary (private tab? storage blocked?) — your conversation stays live, but it won't be kept if you close this tab. Open this page in a normal tab and hit ⧉ Copy all / Save to rescue any diary you've been keeping.", "system");
+  }
   const seed = await journalToday(30);
   if (seed.length > 0) {
     for (const e of seed) addMessage(e.text, e.role === "user" ? "me" : "her");
