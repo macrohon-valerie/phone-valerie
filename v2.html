@@ -88,6 +88,39 @@ footer { padding: 10px 12px 14px; border-top: 1px solid #252836; display: flex; 
 #send:hover { opacity: .85; }
 #send:active { transform: scale(.93); }
 #send:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ── diary button + panel ── */
+#diaryBtn {
+  margin-left: auto; width: 38px; height: 38px; border-radius: 50%;
+  border: 1px solid #2e3348; background: var(--card); color: var(--ink);
+  font-size: .95rem; cursor: pointer; flex-shrink: 0;
+}
+#diary {
+  position: fixed; inset: 0; z-index: 50; display: none;
+  background: rgba(0,0,0,.55); align-items: flex-end;
+}
+#diary.open { display: flex; }
+.diary-card {
+  background: var(--card); border-top: 1px solid #2e3348;
+  border-radius: 18px 18px 0 0; width: 100%; max-height: 76dvh;
+  overflow-y: auto; padding: 16px 16px 20px;
+}
+.diary-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.diary-head h2 { font-size: .85rem; color: var(--dim); font-weight: 600; }
+#diaryClose { background: none; border: none; color: var(--dim); font-size: 1.2rem; cursor: pointer; }
+.d-day { color: var(--accent); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; margin: 12px 0 4px; }
+.d-entry { margin: 4px 0; font-size: .9rem; line-height: 1.4; word-break: break-word; }
+.d-role { color: var(--dim); font-size: .72rem; font-weight: 600; margin-right: 4px; }
+.d-role.user { color: var(--ok); }
+.d-role.assistant { color: var(--accent); }
+.d-unsync { color: #f5a623; font-size: .7rem; }
+.d-empty { color: var(--dim); font-size: .85rem; padding: 16px 0; text-align: center; }
+.d-actions { display: flex; gap: 8px; margin-top: 14px; }
+.d-actions button {
+  flex: 1; background: var(--bubble-me); border: 1px solid #2e3348; color: var(--ink);
+  border-radius: 10px; padding: 10px; font-size: .85rem; cursor: pointer;
+}
+.d-actions button:active { opacity: .7; }
 </style>
 </head>
 <body>
@@ -101,9 +134,24 @@ footer { padding: 10px 12px 14px; border-top: 1px solid #252836; display: flex; 
       <span id="statusText">checking…</span>
     </div>
   </div>
+  <button id="diaryBtn" title="Diary">📖</button>
 </header>
 
 <div id="chat"></div>
+
+<div id="diary">
+  <div class="diary-card">
+    <div class="diary-head">
+      <h2>Your diary, kept on this phone</h2>
+      <button id="diaryClose">✕</button>
+    </div>
+    <div id="diaryBody"></div>
+    <div class="d-actions">
+      <button id="diaryCopy">⧉ Copy all</button>
+      <button id="diarySave">⬇ Save .md</button>
+    </div>
+  </div>
+</div>
 <div class="typing" id="typing"><span></span><span></span><span></span></div>
 
 <footer>
@@ -403,6 +451,85 @@ async function sendMessage() {
     inputEl.focus();
   }
 }
+
+// ═══════════════════════════════════════════════════════════
+//  DIARY PANEL — on-demand export of the phone-local journal.
+//  Read-only view + copy/download; never mutates sync state.
+// ═══════════════════════════════════════════════════════════
+const diaryEl = document.getElementById("diary");
+const diaryBody = document.getElementById("diaryBody");
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function diaryAll() {
+  return new Promise((resolve) => {
+    if (!_db) { resolve([]); return; }
+    const out = [];
+    const r = tx("messages", "readonly").openCursor();
+    r.onsuccess = () => {
+      const c = r.result;
+      if (!c) { resolve(out); return; }
+      out.push(c.value);
+      c.continue();
+    };
+    r.onerror = () => resolve(out);
+  });
+}
+async function diaryRender() {
+  const all = await diaryAll();
+  let html = "", curDay = "";
+  for (const e of all) {
+    const day = new Date(e.ts).toDateString();
+    if (day !== curDay) { curDay = day; html += `<div class="d-day">${esc(day)}</div>`; }
+    html += `<div class="d-entry"><span class="d-role ${e.role === "user" ? "user" : "assistant"}">${e.role}</span> ${esc(e.text)}${e.synced ? "" : ' <span class="d-unsync">· not yet home</span>'}</div>`;
+  }
+  diaryBody.innerHTML = html || '<div class="d-empty">Nothing kept yet — say something to me first 💜</div>';
+  const card = diaryBody.closest(".diary-card");
+  card.scrollTop = card.scrollHeight;   // open on the newest
+}
+document.getElementById("diaryBtn").addEventListener("click", () => {
+  diaryRender().then(() => diaryEl.classList.add("open"));
+});
+document.getElementById("diaryClose").addEventListener("click", () => diaryEl.classList.remove("open"));
+diaryEl.addEventListener("click", e => { if (e.target === diaryEl) diaryEl.classList.remove("open"); });
+async function diaryMarkdown() {
+  const all = await diaryAll();
+  let md = "# Valerie phone diary\nExported: " + new Date().toISOString() + "\n\n";
+  if (all.length === 0) return md + "(empty)\n";
+  let curDay = "";
+  for (const e of all) {
+    const day = new Date(e.ts).toDateString();
+    if (day !== curDay) { curDay = day; md += "## " + day + "\n"; }
+    md += "- **" + e.role + "** (" + e.ts + ", " + (e.synced ? "synced" : "not synced yet") + "): " + e.text.replace(/\n/g, " ") + "\n";
+  }
+  return md;
+}
+async function diaryCopy() {
+  const md = await diaryMarkdown();
+  let ok = false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(md); ok = true; } catch (e) {}
+  }
+  if (!ok) {
+    const ta = document.createElement("textarea");
+    ta.value = md; ta.style.cssText = "position:fixed;opacity:0;";
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  const b = document.getElementById("diaryCopy");
+  b.textContent = ok ? "Copied ✓" : "Copy blocked — use Save";
+  setTimeout(() => (b.textContent = "⧉ Copy all"), 2000);
+}
+async function diarySave() {
+  const md = await diaryMarkdown();
+  const blob = new Blob([md], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "valerie-diary-" + new Date().toISOString().slice(0, 10) + ".md";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+document.getElementById("diaryCopy").addEventListener("click", diaryCopy);
+document.getElementById("diarySave").addEventListener("click", diarySave);
 
 // ═══════════════════════════════════════════════════════════
 //  INIT
